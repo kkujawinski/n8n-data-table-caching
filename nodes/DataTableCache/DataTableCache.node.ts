@@ -1,5 +1,6 @@
 import {
 	NodeOperationError,
+	type IDataObject,
 	type IExecuteFunctions,
 	type ILoadOptionsFunctions,
 	type INodeExecutionData,
@@ -12,6 +13,24 @@ import { isExpiredByTtl, safeParse } from './helpers';
 import { dataTableRequest, unwrapRows } from './stores/client';
 import { makeStore } from './stores/makeStore';
 
+/**
+ * Read-through cache as a single node, wired like the Loop Over Items node:
+ * one input, two outputs, and a cycle.
+ *
+ *   input ─▶ [Cache] ─ hit  ─▶ Continue
+ *                  └ miss ─▶ Process ─▶ your work ─┐
+ *                    ▲────────── loop back ────────┘
+ *
+ *   - First pass (lookup): a fresh hit is emitted on **Continue**; a miss (or expired
+ *     row) is emitted on **Process** and the key is remembered for this execution.
+ *   - Loop-back pass (store): when the processed item returns on the same input, the node
+ *     stores it and emits it on **Continue**.
+ *
+ * Pass detection uses per-execution node state (`getContext('node')`), the same mechanism
+ * Loop Over Items uses, keyed by the cache key. The key is recomputed from the returned
+ * item, so the field(s) the Cache Key expression derives from must survive your processing
+ * — otherwise the loop-back item won't be recognised as a store pass.
+ */
 export class DataTableCache implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'Data Table Cache',
@@ -19,35 +38,13 @@ export class DataTableCache implements INodeType {
 		icon: 'file:datatablecache.svg',
 		group: ['transform'],
 		version: 1,
-		subtitle: '={{ $parameter["operation"] }}',
-		description: 'Read-through / write-back cache backed by an n8n data table',
+		description: 'Read-through cache backed by an n8n data table; loops misses out for processing',
 		defaults: { name: 'Data Table Cache' },
 		inputs: ['main'],
 		outputs: ['main', 'main'],
-		outputNames: ['Cache Hit', 'Cache Miss'],
+		outputNames: ['Continue', 'Process'],
 		credentials: [{ name: 'dataTableCacheApi', required: true }],
 		properties: [
-			{
-				displayName: 'Operation',
-				name: 'operation',
-				type: 'options',
-				noDataExpression: true,
-				options: [
-					{
-						name: 'Lookup',
-						value: 'lookup',
-						description: 'Check the cache and route the item to Hit or Miss',
-						action: 'Look up a cached item',
-					},
-					{
-						name: 'Store',
-						value: 'store',
-						description: 'Write the item payload and timestamps to the cache',
-						action: 'Store an item in the cache',
-					},
-				],
-				default: 'lookup',
-			},
 			{
 				displayName: 'Data Table',
 				name: 'dataTableId',
@@ -96,7 +93,8 @@ export class DataTableCache implements INodeType {
 				type: 'string',
 				default: '',
 				required: true,
-				description: 'Value to look up / store under in the key column',
+				description:
+					'Value to look up / store under. Derive it from a field that survives your processing nodes (such as a record key or order number) so the loop-back item is recognised on its way back.',
 			},
 			{
 				displayName: 'Payload Column',
@@ -125,8 +123,7 @@ export class DataTableCache implements INodeType {
 				type: 'number',
 				default: 3600,
 				typeOptions: { minValue: 0 },
-				description: 'A hit older than this is treated as a miss',
-				displayOptions: { show: { operation: ['lookup'] } },
+				description: 'A hit older than this is treated as a miss and looped out for reprocessing',
 			},
 			{
 				displayName: 'Unit',
@@ -139,7 +136,6 @@ export class DataTableCache implements INodeType {
 					{ name: 'Days', value: 86400000 },
 				],
 				default: 1000,
-				displayOptions: { show: { operation: ['lookup'] } },
 			},
 			{
 				displayName: 'Measure From',
@@ -151,7 +147,6 @@ export class DataTableCache implements INodeType {
 				],
 				default: 'modified',
 				description: 'Which timestamp the max age is measured from',
-				displayOptions: { show: { operation: ['lookup'] } },
 			},
 		],
 	};
@@ -177,12 +172,16 @@ export class DataTableCache implements INodeType {
 
 	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
 		const items = this.getInputData();
-		const hit: INodeExecutionData[] = [];
-		const miss: INodeExecutionData[] = [];
+		const cont: INodeExecutionData[] = [];
+		const process: INodeExecutionData[] = [];
 		const store = makeStore(this);
 
+		// Per-execution scratch space: keys we emitted for processing and now expect back.
+		const context = this.getContext('node');
+		const pending = (context.pendingKeys as Record<string, boolean>) ?? {};
+		context.pendingKeys = pending;
+
 		for (let i = 0; i < items.length; i++) {
-			const operation = this.getNodeParameter('operation', i) as string;
 			const tableId = this.getNodeParameter('dataTableId', i, '', {
 				extractValue: true,
 			}) as string;
@@ -193,46 +192,43 @@ export class DataTableCache implements INodeType {
 			const accessCol = this.getNodeParameter('accessCol', i) as string;
 
 			try {
-				if (operation === 'store') {
-					const existing = await store.get(tableId, keyCol, key);
+				// Store pass: this item is a previously-missed key coming back after processing.
+				if (pending[key]) {
+					delete pending[key];
 					const now = new Date().toISOString();
 					await store.upsert(tableId, keyCol, key, {
 						[payloadCol]: JSON.stringify(items[i].json),
 						[modifiedCol]: now,
 						[accessCol]: now,
 					});
-					hit.push({
-						json: { updated: existing !== null, key, payload: items[i].json },
-						pairedItem: { item: i },
-					});
+					cont.push({ json: items[i].json, pairedItem: { item: i } });
 					continue;
 				}
 
-				// lookup
+				// Lookup pass.
 				const row = await store.get(tableId, keyCol, key);
-				if (!row) {
-					miss.push({ json: items[i].json, pairedItem: { item: i } });
-					continue;
-				}
 
 				const ttl = this.getNodeParameter('ttl', i) as number;
 				const ttlUnit = this.getNodeParameter('ttlUnit', i) as number;
 				const ttlFrom = this.getNodeParameter('ttlFrom', i) as string;
 				const fromCol = ttlFrom === 'access' ? accessCol : modifiedCol;
 
-				if (isExpiredByTtl(row, { fromCol, maxAgeMs: ttl * ttlUnit })) {
-					miss.push({
-						json: { ...items[i].json, _staleRow: row },
-						pairedItem: { item: i },
-					});
+				const missed = !row || isExpiredByTtl(row, { fromCol, maxAgeMs: ttl * ttlUnit });
+				if (missed) {
+					pending[key] = true;
+					const json: IDataObject = { ...items[i].json };
+					if (row) json._staleRow = row as IDataObject;
+					process.push({ json, pairedItem: { item: i } });
 					continue;
 				}
 
+				// Fresh hit: bump last_access and emit the cached payload.
 				await store.touch(tableId, keyCol, key, { [accessCol]: new Date().toISOString() });
-				hit.push({ json: safeParse(row[payloadCol]), pairedItem: { item: i } });
+				cont.push({ json: safeParse(row![payloadCol]), pairedItem: { item: i } });
 			} catch (error) {
 				if (this.continueOnFail()) {
-					miss.push({
+					// Emit on Continue (not Process) so a failure never re-enters the loop.
+					cont.push({
 						json: { ...items[i].json, error: (error as Error).message },
 						pairedItem: { item: i },
 					});
@@ -242,6 +238,6 @@ export class DataTableCache implements INodeType {
 			}
 		}
 
-		return [hit, miss];
+		return [cont, process];
 	}
 }

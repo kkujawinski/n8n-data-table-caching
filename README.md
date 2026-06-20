@@ -12,15 +12,35 @@ and TTL expiry.
 
 ## What it does
 
-- **Lookup** — read a row by cache key and route the item to **Cache Hit** or **Cache Miss**.
-  Hits older than the configured **Max Age** are routed to **Cache Miss** instead (and the
-  stale row is attached as `_staleRow` for debugging). A hit bumps `last_access`.
-- **Store** — upsert the input item's JSON as the payload plus `last_modified` / `last_access`
-  timestamps, keyed by cache key.
+A single read-through cache node, wired like the **Loop Over Items** node — one input, two
+outputs, and a cycle:
 
-Two outputs: index `0` = **Cache Hit**, index `1` = **Cache Miss**. `Store` always emits on
-the **Cache Hit** output with `{ updated, key, payload }`, where `updated` is `true` if a row
-for that key already existed (overwrite) or `false` if a new row was inserted.
+```
+        ┌────────── Data Table Cache ──────────┐
+input ─▶ │  hit  → Continue (cached payload)    │──▶ continue
+         │  miss → Process                      │──▶ expensive work ─┐
+         │  (loop-back: store, then → Continue) │◀──────────────────-┘
+         └──────────────────────────────────────┘
+```
+
+- **First pass (lookup).** Read the row by cache key. A fresh hit is emitted on **Continue**
+  with the parsed payload (and `last_access` is bumped). A miss — or a hit older than **Max
+  Age** — is emitted on **Process**, and the key is remembered for this execution. Expired
+  hits also attach the stale row as `_staleRow` for debugging.
+- **Loop-back pass (store).** Wire the **Process** output through your work and back into the
+  node's input. When the processed item returns, the node upserts it (payload +
+  `last_modified` + `last_access`) and emits it on **Continue**.
+
+Outputs: index `0` = **Continue**, index `1` = **Process**.
+
+### Important: the cache key must survive your processing
+
+Pass detection (lookup vs. store) uses per-execution node state keyed by the **cache key**,
+and the key is **recomputed from the returned item** on the loop-back. So derive the Cache Key
+from a field your processing nodes preserve (a record key, order number, etc.). If the key
+can't be recomputed to the same value on the way back, the item won't be recognised as a store
+pass — it'll be treated as a fresh lookup and loop again. (This is the documented tradeoff of
+the single-node loop design.)
 
 ## Install
 
@@ -78,10 +98,9 @@ credential to **API Key** — no workflow changes needed.
 
 | Parameter            | Default         | Notes                                            |
 | -------------------- | --------------- | ------------------------------------------------ |
-| Operation            | `Lookup`        | `Lookup` or `Store`                              |
 | Data Table           | —               | Pick from list or enter the table ID             |
 | Key Column           | `cache_key`     | Column matched against the cache key             |
-| Cache Key            | —               | Expression-friendly; the value to look up / store |
+| Cache Key            | —               | Expression-friendly; derive from a field that survives processing |
 | Payload Column       | `payload`       | Holds the stringified payload                    |
 | Last Modified Column | `last_modified` | ISO datetime of last write                       |
 | Last Access Column   | `last_access`   | ISO datetime of last hit                         |
@@ -91,20 +110,25 @@ credential to **API Key** — no workflow changes needed.
 ## Example flow
 
 ```
-Trigger ─▶ Data Table Cache (Lookup)
-                 ├─ Cache Hit  ─▶ use cached payload
-                 └─ Cache Miss ─▶ do the expensive work ─▶ Data Table Cache (Store) ─▶ continue
+Trigger ─▶ Data Table Cache ─ Continue ─▶ use payload (cached or freshly stored) ─▶ …
+                            └ Process  ─▶ expensive work ─┐
+                              ▲────────── loop back ──────┘
 ```
+
+Wire **Process** through your work and back into the node's input; wire **Continue** onward.
+On a hit it fires immediately; on a miss it fires after the loop-back stores the result.
 
 ## Notes & limitations
 
+- **Cache key must survive processing** — see [above](#important-the-cache-key-must-survive-your-processing).
+  If a returned item's key can't be recomputed, it loops again instead of being stored.
 - **Concurrency:** last-write-wins. Acceptable for a cache; do not use as a transactional store.
 - **Malformed payload:** a non-JSON / legacy payload degrades gracefully — a hit returns
   `{ _raw: <value> }` rather than throwing.
 - **Expiry:** TTL only for now. Filter-condition ("reuse the IF builder") expiry is planned;
   it depends on a mutation-then-evaluate workaround that must be validated per n8n version.
-- **Continue On Fail:** when enabled, a row that errors is routed to **Cache Miss** with an
-  `error` field instead of failing the execution.
+- **Continue On Fail:** when enabled, a row that errors is emitted on **Continue** (never
+  back into the loop) with an `error` field, instead of failing the execution.
 
 ## Data access — the fragile part
 
