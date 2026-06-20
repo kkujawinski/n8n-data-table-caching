@@ -15,7 +15,7 @@ The node stores each cached item as one row. The full schema is four columns (n8
 | `cache_key`     | `string`           | Yes                               | The lookup key (e.g. a record id, a hash) | Matched on every lookup/upsert                                |
 | `payload`       | `string`           | Yes                               | `JSON.stringify` of the cached item       | The node writes/reads text — **must be `string`**, not `json` |
 | `last_modified` | `string` or `date` | Yes                               | ISO-8601 timestamp of the last write      | Default TTL source                                            |
-| `last_access`   | `string` or `date` | **Optional**                      | ISO-8601 timestamp of the last cache hit  | Only for **Measure From = Last Access** (idle TTL) or LRU cleanup |
+| `last_access`   | `string` or `date` | **Optional**                      | ISO-8601 timestamp of the last cache hit  | Only for **Measure From = Last Access** (idle TTL) or LRU eviction |
 
 > - **`payload` must be `string`** — a `json` column breaks the `JSON.stringify` / `JSON.parse`
 >   round-trip (hits come back as `{ "_raw": ... }`).
@@ -23,7 +23,7 @@ The node stores each cached item as one row. The full schema is four columns (n8
 >   read-back values as UTC either way, so the TTL stays correct.
 > - **`last_access` is optional** — leave the node's **Last Access Column** empty to skip it (a
 >   minimal table is `cache_key` + `payload` + `last_modified`). You only need it for
->   **Measure From = Last Access** or idle-time cleanup.
+>   **Measure From = Last Access** or idle-time eviction.
 
 ### Create it in the UI
 
@@ -40,7 +40,7 @@ is **String** (re-set if n8n inferred `json`); timestamps may be String or Date.
 seed row if you don't want it.
 
 **By hand.** **Data tables → Create** → add the columns from the table above (omit
-`last_access` unless you need idle-time TTL or cleanup).
+`last_access` unless you need idle-time TTL or eviction).
 
 Copy the table id from the URL when done.
 
@@ -51,8 +51,7 @@ Copy the table id from the URL when done.
 The node uses the **built-in `n8n API` credential** (no custom credential):
 
 1. In n8n: **Settings → n8n API → Create an API key**. Give the key the data-table scopes:
-   `dataTable:list`, `dataTableRow:read`, `dataTableRow:upsert`, `dataTableRow:update`
-   (and `dataTableRow:delete` if you run the cleanup below).
+   `dataTable:list`, `dataTableRow:read`, `dataTableRow:upsert`, `dataTableRow:update`.
 2. **Credentials → New → n8n API**:
    - **Base URL** — must end in `/api/v1`, e.g. `http://localhost:5678/api/v1`.
    - **API Key** — the key from step 1.
@@ -105,8 +104,9 @@ Derive **Cache Key** from a field present on both the lookup item and the proces
 - **Measure From**:
   - `Last Modified` — time since the value was cached (most caches want this). The default;
     needs no `last_access` column.
-  - `Last Access` — time since it was last read; combine with a cleanup job for LRU-style
-    eviction. **Requires the Last Access Column** to be set (the node errors if it isn't).
+  - `Last Access` — time since it was last read; combine with a scheduled eviction job for
+    LRU-style eviction. **Requires the Last Access Column** to be set (the node errors if it
+    isn't).
 - Expired lookups attach the stale row under `_staleRow` on the miss item, for debugging or
   serve-stale-on-error patterns.
 
@@ -114,21 +114,17 @@ Derive **Cache Key** from a field present on both the lookup item and the proces
 
 ## 6. Maintenance — evict expired rows
 
-Data tables don't auto-delete expired rows, so the table grows until you prune it. Because
-timestamps are ISO-8601 **text**, a `lt` filter compares them chronologically. Delete rows not
-modified since a cutoff (needs scope `dataTableRow:delete`):
+Data tables don't auto-delete expired rows, so the table grows until you prune it. Do this with
+a separate n8n **Data Table** node pointed at the same Cache data table:
 
-```bash
-CUTOFF=$(date -u -v-7d +%Y-%m-%dT%H:%M:%S.000Z)   # 7 days ago (GNU: date -u -d '7 days ago' +...)
-FILTER=$(printf '{"type":"and","filters":[{"columnName":"last_modified","condition":"lt","value":"%s"}]}' "$CUTOFF")
+- Add a **Schedule Trigger** → **Data Table** node (operation **Delete Rows**) over the Cache
+  table.
+- Filter on `last_modified` **less than** a cutoff timestamp, e.g.
+  `={{ $now.minus({ days: 7 }).toUTC().toISO() }}`. Because timestamps are ISO-8601 **text**, a
+  less-than comparison sorts them chronologically.
+- To evict by idle time instead, filter on `last_access`.
 
-curl -sS -X DELETE "$N8N_BASE_URL/data-tables/<TABLE_ID>/rows" \
-  -H "X-N8N-API-KEY: $N8N_API_KEY" \
-  --get --data-urlencode "filter=$FILTER"
-```
-
-Run it on a schedule (cron, or a small n8n Schedule-triggered workflow with an HTTP Request
-node). To evict by idle time instead, filter on `last_access`.
+This keeps eviction entirely inside n8n — no API key or extra scopes required.
 
 > Keep payloads compact — all data tables in an instance share a default **50 MB** limit
 > (`N8N_DATA_TABLES_MAX_SIZE_BYTES` to raise it on self-hosted).

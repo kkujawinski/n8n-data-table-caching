@@ -23,7 +23,7 @@ Two inputs (`Input`, `Update`), two outputs (`Cache Hit`, `Cache Miss`), wired a
 Wire it as a loop: **Cache Miss → your work → the Update input**; take **Cache Hit** onward.
 
 ➡️ **[Usage guide](docs/USAGE.md)** — table setup, credential, an importable example workflow,
-TTL, and cleanup.
+TTL, and evicting expired rows.
 
 ## Install
 
