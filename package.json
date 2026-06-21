@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-datatable-cache",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Read-through / write-back cache node backed by an n8n data table",
   "keywords": [
     "n8n-community-node-package",
