@@ -10,14 +10,14 @@
     "datatable"
   ],
   "license": "MIT",
-  "homepage": "https://github.com/kamilkujawinski/n8n-nodes-datatable-cache",
+  "homepage": "https://github.com/kkujawinski/n8n-data-table-cache",
   "author": {
     "name": "Kamil Kujawinski",
     "email": "kamil@kujawin.ski"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/kamilkujawinski/n8n-nodes-datatable-cache.git"
+    "url": "git+https://github.com/kkujawinski/n8n-data-table-cache.git"
   },
   "engines": {
     "node": ">=20.15"
