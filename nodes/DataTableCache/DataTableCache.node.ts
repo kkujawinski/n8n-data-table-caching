@@ -10,7 +10,7 @@ import {
 	type INodeTypeDescription,
 } from 'n8n-workflow';
 
-import { isExpiredByTtl, safeParse } from './helpers';
+import { isExpiredByTtl, safeParse, SYSTEM_COLUMNS } from './helpers';
 import { dataTableRequest, unwrapRows } from './stores/client';
 import { makeStore } from './stores/makeStore';
 
@@ -25,10 +25,15 @@ async function fetchColumnOptions(ctx: ILoadOptionsFunctions): Promise<INodeProp
 		? (response as IDataObject[])
 		: ((response as IDataObject)?.data as IDataObject[]) ?? [];
 
-	return columns
-		.map((column) => String(column.name ?? ''))
-		.filter((name) => name)
-		.map((name) => ({ name, value: name }));
+	const names = columns.map((column) => String(column.name ?? '')).filter((name) => name);
+
+	// Append any system columns the endpoint didn't already report.
+	const seen = new Set(names);
+	for (const name of SYSTEM_COLUMNS) {
+		if (!seen.has(name)) names.push(name);
+	}
+
+	return names.map((name) => ({ name, value: name }));
 }
 
 /**

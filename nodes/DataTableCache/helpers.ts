@@ -11,6 +11,34 @@ export const TTL_UNITS = {
 } as const;
 
 /**
+ * Columns n8n creates and maintains automatically on every data table. The `/columns`
+ * endpoint omits them, so they're added to the dropdowns by hand (e.g. `updatedAt` is a
+ * natural "last modified" column). They are READ-ONLY: the API rejects any write to them
+ * with HTTP 400, so they must be stripped from write payloads.
+ */
+export const SYSTEM_COLUMNS = ['updatedAt'] as const;
+
+const SYSTEM_COLUMN_SET: ReadonlySet<string> = new Set(SYSTEM_COLUMNS);
+
+/** True if `name` is a system column n8n maintains automatically. */
+export function isSystemColumn(name: string): boolean {
+	return SYSTEM_COLUMN_SET.has(name);
+}
+
+/**
+ * Drop any system columns from a write payload. Selecting `updatedAt`/`createdAt` as a
+ * timestamp column is valid for *reading* the TTL, but n8n maintains them itself and
+ * rejects writes to them — so the node simply doesn't write them.
+ */
+export function stripSystemColumns(fields: IDataObject): IDataObject {
+	const out: IDataObject = {};
+	for (const [key, value] of Object.entries(fields)) {
+		if (!isSystemColumn(key)) out[key] = value;
+	}
+	return out;
+}
+
+/**
  * Parse a stored payload, degrading gracefully (BRIEF §2). A malformed or legacy value
  * must never throw — it comes back wrapped as `{ _raw }` so the caller can decide.
  */

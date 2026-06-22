@@ -1,5 +1,6 @@
 import type { IDataObject } from 'n8n-workflow';
 
+import { stripSystemColumns } from '../helpers';
 import type { CacheRow, CacheStore } from './CacheStore';
 import { dataTableRequest, keyFilter, unwrapRows, type RequestContext } from './client';
 
@@ -29,24 +30,30 @@ export class HttpCacheStore implements CacheStore {
 	}
 
 	async upsert(tableId: string, keyCol: string, key: string, fields: CacheRow): Promise<void> {
+		// n8n maintains system columns itself and rejects writes to them; strip them out.
+		const data = stripSystemColumns({ [keyCol]: key, ...fields } as IDataObject);
 		await dataTableRequest(this.ctx, {
 			method: 'POST',
 			path: `/${tableId}/rows/upsert`,
 			body: {
 				filter: keyFilter(keyCol, key),
-				data: { [keyCol]: key, ...fields } as IDataObject,
+				data,
 				returnData: false,
 			},
 		});
 	}
 
 	async touch(tableId: string, keyCol: string, key: string, fields: CacheRow): Promise<void> {
+		const data = stripSystemColumns(fields as IDataObject);
+		// Nothing writable remains (e.g. last_access mapped to a system column n8n bumps
+		// on its own) — skip the request rather than send an empty, rejected update.
+		if (Object.keys(data).length === 0) return;
 		await dataTableRequest(this.ctx, {
 			method: 'PATCH',
 			path: `/${tableId}/rows/update`,
 			body: {
 				filter: keyFilter(keyCol, key),
-				data: fields as IDataObject,
+				data,
 				returnData: false,
 			},
 		});
